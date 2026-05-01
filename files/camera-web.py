@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import subprocess
 import threading
 import time
@@ -7,15 +8,39 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CAMERA_NAME = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a"
 STREAM_TIMEOUT = 10 * 60  # seconds before auto-stop
 
+FLASH_LED = "/sys/class/leds/white:flash/brightness"
+FLASH_BRIGHTNESS = 255
+
 GST_CMD = [
     "gst-launch-1.0", "-q",
     "libcamerasrc", f"camera-name={CAMERA_NAME}",
     "!", "video/x-raw,width=1280,height=720,framerate=15/1",
+    "!", "videoflip", "method=rotate-180",
     "!", "videoconvert",
     "!", "jpegenc", "quality=85",
     "!", "multipartmux", "boundary=frame",
     "!", "fdsink", "fd=1",
 ]
+
+
+def flash_set(on):
+    try:
+        with open(FLASH_LED, "w") as f:
+            f.write(str(FLASH_BRIGHTNESS if on else 0))
+        return True
+    except OSError:
+        return False
+
+
+def flash_get():
+    try:
+        with open(FLASH_LED) as f:
+            return int(f.read().strip()) > 0
+    except OSError:
+        return False
+
+
+atexit.register(lambda: flash_set(False))
 
 HTML = b"""\
 <!DOCTYPE html>
@@ -35,7 +60,8 @@ HTML = b"""\
              align-items: center; justify-content: center; overflow: hidden; }
     #stream { width: 100%; display: none; }
     #placeholder { color: #444; font-size: 1rem; }
-    .controls { display: flex; gap: 0.5rem; align-items: center; }
+    .controls { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+                justify-content: center; }
     button { padding: 0.6rem 1.4rem; border: none; border-radius: 6px;
              font-size: 1rem; cursor: pointer; }
     #start-btn { background: #2d8a4e; color: #fff; }
@@ -44,6 +70,10 @@ HTML = b"""\
     #stop-btn  { background: #8a2d2d; color: #fff; }
     #stop-btn:hover  { background: #a83636; }
     #stop-btn:disabled  { background: #444; cursor: default; }
+    #flash-btn { background: #444; color: #fff; }
+    #flash-btn.on { background: #8a7a2d; color: #fff; }
+    #flash-btn.on:hover { background: #a89936; }
+    #flash-btn:not(.on):hover { background: #555; }
     #status { font-size: 0.85rem; color: #888; min-height: 1.2em; }
   </style>
 </head>
@@ -56,6 +86,7 @@ HTML = b"""\
   <div class="controls">
     <button id="start-btn" onclick="startStream()">&#9654; Start</button>
     <button id="stop-btn"  onclick="stopStream()" disabled>&#9632; Stop</button>
+    <button id="flash-btn" onclick="toggleFlash()">&#9888; Flash: OFF</button>
   </div>
   <p id="status"></p>
   <script>
@@ -99,6 +130,26 @@ HTML = b"""\
         setStatus('');
     }
 
+    async function toggleFlash() {
+      const btn = document.getElementById('flash-btn');
+      const turnOn = !btn.classList.contains('on');
+      try {
+        const resp = await fetch('/flash/' + (turnOn ? 'on' : 'off'));
+        if (resp.ok) {
+          const data = await resp.json();
+          setFlashBtn(data.on);
+        }
+      } catch (e) {
+        setStatus('Flash control failed');
+      }
+    }
+
+    function setFlashBtn(on) {
+      const btn = document.getElementById('flash-btn');
+      btn.textContent = '\u26a0 Flash: ' + (on ? 'ON' : 'OFF');
+      btn.classList.toggle('on', on);
+    }
+
     function setStatus(msg) { document.getElementById('status').textContent = msg; }
     function fmt(s) { return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); }
   </script>
@@ -113,7 +164,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _json(self, data):
+        import json
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if self.path == "/flash/on":
+            flash_set(True)
+            self._json({"on": flash_get()})
+            return
+
+        if self.path == "/flash/off":
+            flash_set(False)
+            self._json({"on": flash_get()})
+            return
+
         if not self.path.startswith("/stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

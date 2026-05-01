@@ -5,6 +5,7 @@ Description=Camera Stream
 ExecStart=/usr/bin/gst-launch-1.0 -q \
   libcamerasrc camera-name='/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a' \
   ! 'video/x-raw,width=1280,height=720,framerate=30/1' \
+  ! videoflip method=rotate-180 \
   ! videoconvert ! vp8enc deadline=1 target-bitrate=4000000 ! webmmux ! fdsink fd=1
 StandardInput=socket
 StandardOutput=socket
