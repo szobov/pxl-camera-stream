@@ -1,0 +1,14 @@
+[Unit]
+Description=3D Printer Camera Web Server
+After=network-online.target wifi-up.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/camera-web.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

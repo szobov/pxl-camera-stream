@@ -1,0 +1,9 @@
+[Unit]
+Description=Camera Stream Socket
+
+[Socket]
+ListenStream=5000
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

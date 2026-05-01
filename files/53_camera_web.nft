@@ -1,0 +1,5 @@
+table inet filter {
+	chain input {
+		iifname "wlan0" tcp dport 8080 accept
+	}
+}
