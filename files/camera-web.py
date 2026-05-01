@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import atexit
+import json
 import subprocess
 import threading
 import time
@@ -9,7 +10,7 @@ CAMERA_NAME = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a"
 STREAM_TIMEOUT = 10 * 60  # seconds before auto-stop
 
 FLASH_LED = "/sys/class/leds/white:flash/brightness"
-FLASH_BRIGHTNESS = 255
+FLASH_MAX = 255
 
 GST_CMD = [
     "gst-launch-1.0", "-q",
@@ -23,24 +24,25 @@ GST_CMD = [
 ]
 
 
-def flash_set(on):
+def flash_set(brightness):
+    brightness = max(0, min(FLASH_MAX, int(brightness)))
     try:
         with open(FLASH_LED, "w") as f:
-            f.write(str(FLASH_BRIGHTNESS if on else 0))
-        return True
+            f.write(str(brightness))
+        return brightness
     except OSError:
-        return False
+        return None
 
 
 def flash_get():
     try:
         with open(FLASH_LED) as f:
-            return int(f.read().strip()) > 0
+            return int(f.read().strip())
     except OSError:
-        return False
+        return 0
 
 
-atexit.register(lambda: flash_set(False))
+atexit.register(lambda: flash_set(0))
 
 HTML = b"""\
 <!DOCTYPE html>
@@ -67,13 +69,13 @@ HTML = b"""\
     #start-btn { background: #2d8a4e; color: #fff; }
     #start-btn:hover { background: #36a85f; }
     #start-btn:disabled { background: #444; cursor: default; }
-    #stop-btn  { background: #8a2d2d; color: #fff; }
-    #stop-btn:hover  { background: #a83636; }
-    #stop-btn:disabled  { background: #444; cursor: default; }
-    #flash-btn { background: #444; color: #fff; }
-    #flash-btn.on { background: #8a7a2d; color: #fff; }
-    #flash-btn.on:hover { background: #a89936; }
-    #flash-btn:not(.on):hover { background: #555; }
+    #stop-btn { background: #8a2d2d; color: #fff; }
+    #stop-btn:hover { background: #a83636; }
+    #stop-btn:disabled { background: #444; cursor: default; }
+    .flash-row { display: flex; align-items: center; gap: 0.6rem;
+                 font-size: 0.9rem; color: #aaa; }
+    #flash-slider { width: 120px; accent-color: #c8a830; cursor: pointer; }
+    #flash-label { min-width: 2.5rem; text-align: right; color: #eee; }
     #status { font-size: 0.85rem; color: #888; min-height: 1.2em; }
   </style>
 </head>
@@ -86,12 +88,17 @@ HTML = b"""\
   <div class="controls">
     <button id="start-btn" onclick="startStream()">&#9654; Start</button>
     <button id="stop-btn"  onclick="stopStream()" disabled>&#9632; Stop</button>
-    <button id="flash-btn" onclick="toggleFlash()">&#9888; Flash: OFF</button>
+    <div class="flash-row">
+      &#9888; Flash
+      <input type="range" id="flash-slider" min="0" max="255" value="0"
+             oninput="onFlashSlider(this.value)">
+      <span id="flash-label">OFF</span>
+    </div>
   </div>
   <p id="status"></p>
   <script>
     const TIMEOUT_S = 10 * 60;
-    let countdownId, deadlineId;
+    let countdownId, deadlineId, flashTimer;
 
     function startStream() {
       const img = document.getElementById('stream');
@@ -130,24 +137,11 @@ HTML = b"""\
         setStatus('');
     }
 
-    async function toggleFlash() {
-      const btn = document.getElementById('flash-btn');
-      const turnOn = !btn.classList.contains('on');
-      try {
-        const resp = await fetch('/flash/' + (turnOn ? 'on' : 'off'));
-        if (resp.ok) {
-          const data = await resp.json();
-          setFlashBtn(data.on);
-        }
-      } catch (e) {
-        setStatus('Flash control failed');
-      }
-    }
-
-    function setFlashBtn(on) {
-      const btn = document.getElementById('flash-btn');
-      btn.textContent = '\u26a0 Flash: ' + (on ? 'ON' : 'OFF');
-      btn.classList.toggle('on', on);
+    function onFlashSlider(val) {
+      val = parseInt(val);
+      document.getElementById('flash-label').textContent = val === 0 ? 'OFF' : val;
+      clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => fetch('/flash/' + val), 120);
     }
 
     function setStatus(msg) { document.getElementById('status').textContent = msg; }
@@ -165,7 +159,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _json(self, data):
-        import json
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -174,14 +167,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/flash/on":
-            flash_set(True)
-            self._json({"on": flash_get()})
-            return
-
-        if self.path == "/flash/off":
-            flash_set(False)
-            self._json({"on": flash_get()})
+        if self.path.startswith("/flash/"):
+            try:
+                brightness = int(self.path[len("/flash/"):])
+                result = flash_set(brightness)
+                self._json({"brightness": result if result is not None else flash_get()})
+            except ValueError:
+                self.send_error(400, "brightness must be an integer 0-255")
             return
 
         if not self.path.startswith("/stream"):
