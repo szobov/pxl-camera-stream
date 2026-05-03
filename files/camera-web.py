@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-import atexit, json, os, subprocess, threading, time
+import atexit, json, os, subprocess, sys, threading, time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Full, Queue
+
+
+def _log(*args):
+    print(*args, file=sys.stderr, flush=True)
 
 CAMERA_NAME = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a"
 RECORDINGS_DIR = "/var/local/camera-recordings"
@@ -232,16 +236,15 @@ class PipelineManager:
         while proc.poll() is None:
             chunk = proc.stdout.read(8192)
             if not chunk:
+                _log("[broadcast] empty read — pipe closed")
                 break
             with self._clients_lock:
-                dead = []
                 for q in clients:
                     try:
                         q.put_nowait(chunk)
                     except Full:
-                        dead.append(q)
-                for q in dead:
-                    clients.discard(q)
+                        pass  # Slow client: drop this chunk, keep connection alive
+        _log(f"[broadcast] loop exit — proc returncode={proc.poll()}")
         # Sentinel: only tell THIS pipeline's subscribers the stream is over.
         with self._clients_lock:
             for q in clients:
@@ -630,13 +633,17 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         chunk = q.get(timeout=30)
                     except Empty:
-                        break          # pipeline likely dead/not starting
+                        _log("[stream] queue empty timeout — pipeline not producing")
+                        break
                     if chunk is None:
-                        break          # sentinel: pipeline stopped
+                        _log("[stream] sentinel — pipeline stopped")
+                        break
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                _log(f"[stream] unexpected exception: {e!r}")
             finally:
                 _pipeline.unsubscribe(q)
             return
