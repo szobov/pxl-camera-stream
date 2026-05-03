@@ -62,9 +62,14 @@ def _gst_record_cmd(filepath):
     """
     Tee pipeline:
       branch 1 → 15 fps MJPEG multipart to stdout  (live view)
-      branch 2 → 1 fps MJPEG into an AVI file       (timelapse recording)
+      branch 2 → 1 fps H.264 into an MKV file       (timelapse recording)
     The broadcaster thread always drains stdout so the pipeline never blocks
     even when no HTTP client is connected.
+
+    Recording branch uses x264enc at CRF 32, 640x360, 1 fps.
+    Typical size: ~1-3 MB/min vs ~38 MB/min for the old MJPEG-AVI branch.
+    matroskamux is used instead of mp4mux because it writes index entries
+    incrementally — the file is playable even if the recording is interrupted.
     """
     return [
         "gst-launch-1.0", "-q",
@@ -73,17 +78,19 @@ def _gst_record_cmd(filepath):
         "!", "videoflip", "method=rotate-180",
         "!", "videoconvert",
         "!", "tee", "name=t",
-        # -- live branch --
+        # -- live branch (unchanged: 15 fps, quality 85) --
         "t.", "!", "queue",
               "!", "jpegenc", "quality=85",
               "!", "multipartmux", "boundary=frame",
               "!", "fdsink", "fd=1",
-        # -- recording branch (1 fps timelapse) --
+        # -- recording branch: 1 fps, 640x360, H.264 CRF 32 → MKV --
         "t.", "!", "queue",
               "!", "videorate",
               "!", "video/x-raw,framerate=1/1",
-              "!", "jpegenc", "quality=85",
-              "!", "avimux",
+              "!", "videoscale",
+              "!", "video/x-raw,width=640,height=360",
+              "!", "x264enc", "tune=stillimage", "pass=qual", "quantizer=32",
+              "!", "matroskamux",
               "!", "filesink", f"location={filepath}",
     ]
 
@@ -126,7 +133,7 @@ class PipelineManager:
             self._stop_locked()
             os.makedirs(RECORDINGS_DIR, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fp = os.path.join(RECORDINGS_DIR, f"rec_{ts}.avi")
+            fp = os.path.join(RECORDINGS_DIR, f"rec_{ts}.mkv")
             self.recording_file = fp
             self.recording_done = None
             self._launch(_gst_record_cmd(fp), "record", duration_secs)

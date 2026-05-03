@@ -25,6 +25,8 @@ apk add --no-cache \
     gst-plugins-base \
     gst-plugins-good \
     gst-plugins-bad \
+    gst-plugins-ugly \
+    x264-libs \
     gstreamer-tools
 
 # ---------------------------------------------------------------------------
