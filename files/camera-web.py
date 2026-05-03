@@ -186,11 +186,17 @@ class PipelineManager:
         self.mode = mode
         self.start_time = time.monotonic()
         self.end_time = (self.start_time + duration_secs) if duration_secs else None
+        # Fresh client set for this pipeline instance.  The broadcast loop
+        # captures this reference so its sentinel can never reach clients
+        # that subscribed to a later pipeline.
+        with self._clients_lock:
+            self._clients = set()
+        my_clients = self._clients
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         threading.Thread(
-            target=self._broadcast_loop, args=(self._proc,), daemon=True
+            target=self._broadcast_loop, args=(self._proc, my_clients), daemon=True
         ).start()
         if duration_secs:
             self._timer = threading.Timer(duration_secs, self._on_timer)
@@ -221,24 +227,24 @@ class PipelineManager:
         self.start_time = None
         self.end_time = None
 
-    def _broadcast_loop(self, proc):
-        """Read proc stdout and push to all subscriber queues."""
+    def _broadcast_loop(self, proc, clients):
+        """Read proc stdout and push to this pipeline's subscriber queues."""
         while proc.poll() is None:
             chunk = proc.stdout.read(8192)
             if not chunk:
                 break
             with self._clients_lock:
                 dead = []
-                for q in self._clients:
+                for q in clients:
                     try:
                         q.put_nowait(chunk)
                     except Full:
                         dead.append(q)
                 for q in dead:
-                    self._clients.discard(q)
-        # Sentinel: tell subscribers the stream is over.
+                    clients.discard(q)
+        # Sentinel: only tell THIS pipeline's subscribers the stream is over.
         with self._clients_lock:
-            for q in self._clients:
+            for q in clients:
                 try:
                     q.put_nowait(None)
                 except Exception:
