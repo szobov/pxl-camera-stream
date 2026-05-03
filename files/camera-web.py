@@ -136,8 +136,8 @@ class PipelineManager:
             self._stop_locked()
 
     def subscribe(self):
-        """Return a Queue that receives MJPEG broadcast chunks."""
-        q = Queue(maxsize=200)
+        """Return a Queue that receives complete MJPEG frame bytes."""
+        q = Queue(maxsize=3)   # 3 complete frames ≈ 300-600 KB, minimal lag
         with self._clients_lock:
             self._clients.add(q)
         return q
@@ -232,20 +232,42 @@ class PipelineManager:
         self.end_time = None
 
     def _broadcast_loop(self, proc, clients):
-        """Read proc stdout and push to this pipeline's subscriber queues."""
+        """Assemble complete MJPEG frames from proc stdout and broadcast them.
+
+        Reads raw bytes into a bytearray, locates consecutive --frame
+        boundaries, and enqueues the bytes between them as one atomic frame.
+        When a client queue is full, the whole frame is dropped for that
+        client — never a partial one — so the browser always gets intact JPEG.
+        """
+        BOUND = b"--frame\r\n"
+        pending = bytearray()
+
         while proc.poll() is None:
-            chunk = proc.stdout.read(8192)
+            chunk = proc.stdout.read(65536)
             if not chunk:
                 _log("[broadcast] empty read — pipe closed")
                 break
-            with self._clients_lock:
-                for q in clients:
-                    try:
-                        q.put_nowait(chunk)
-                    except Full:
-                        pass  # Slow client: drop this chunk, keep connection alive
+            pending.extend(chunk)
+
+            # Emit every complete frame we can find in the buffer
+            while True:
+                b0 = pending.find(BOUND)
+                if b0 == -1:
+                    break
+                b1 = pending.find(BOUND, b0 + len(BOUND))
+                if b1 == -1:
+                    break                      # second boundary not yet arrived
+                frame = bytes(pending[b0:b1])
+                del pending[:b1]              # slide window forward
+                with self._clients_lock:
+                    for q in clients:
+                        try:
+                            q.put_nowait(frame)
+                        except Full:
+                            pass              # drop whole frame, keep connection
+
         _log(f"[broadcast] loop exit — proc returncode={proc.poll()}")
-        # Sentinel: only tell THIS pipeline's subscribers the stream is over.
+        # Sentinel: only THIS pipeline's subscribers.
         with self._clients_lock:
             for q in clients:
                 try:
