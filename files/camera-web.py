@@ -70,6 +70,27 @@ def _gst_record_cmd(filepath):
     Typical size: ~1-3 MB/min vs ~38 MB/min for the old MJPEG-AVI branch.
     matroskamux is used instead of mp4mux because it writes index entries
     incrementally — the file is playable even if the recording is interrupted.
+
+    Pipeline notes:
+    - videorate max-rate=1 (NOT videorate + caps filter framerate=1/1):
+      videorate is an in-place transform; a downstream framerate caps filter
+      silently breaks frame flow with x264enc negotiating I420 upstream.
+      max-rate=1 property avoids caps renegotiation entirely.
+    - videoscale + videoconvert + caps BEFORE videorate: videorate must see
+      a consistent format on both sides of the element.
+    - x264enc key-int-max=1: forces every frame to be a keyframe, eliminating
+      the default rc-lookahead=40 delay (40 s at 1 fps before first output).
+    - queue leaky=downstream on recording branch: slow x264enc startup does
+      not stall the live branch.
+    - filesink async=false: with two tee branches, filesink defaults to async
+      preroll (async=true), which deadlocks — the pipeline stays in PAUSED
+      waiting for filesink's first buffer, but x264enc won't process frames
+      until PLAYING is reached.  async=false makes filesink report its state
+      change complete immediately, breaking the deadlock.
+    - fdsink sync=false: fdsink defaults to sync=true, which causes the live
+      branch to throttle to the recording branch's 1 fps clock, starving the
+      recording branch of buffers and producing a 0-byte MKV.  sync=false lets
+      the live branch drain at its own rate without blocking the pipeline clock.
     """
     return [
         "gst-launch-1.0", "-q",
@@ -82,16 +103,16 @@ def _gst_record_cmd(filepath):
         "t.", "!", "queue",
               "!", "jpegenc", "quality=85",
               "!", "multipartmux", "boundary=frame",
-              "!", "fdsink", "fd=1",
+              "!", "fdsink", "fd=1", "sync=false",
         # -- recording branch: 1 fps, 640x360, H.264 CRF 32 → MKV --
-        "t.", "!", "queue",
-              "!", "videorate",
-              "!", "video/x-raw,framerate=1/1",
+        "t.", "!", "queue", "leaky=downstream",
               "!", "videoscale",
-              "!", "video/x-raw,width=640,height=360",
-              "!", "x264enc", "tune=stillimage", "pass=qual", "quantizer=32",
+              "!", "videoconvert",
+              "!", "video/x-raw,format=I420,width=640,height=360",
+              "!", "videorate", "max-rate=1",
+              "!", "x264enc", "speed-preset=superfast", "pass=qual", "quantizer=32", "key-int-max=1",
               "!", "matroskamux",
-              "!", "filesink", f"location={filepath}",
+              "!", "filesink", f"location={filepath}", "async=false",
     ]
 
 
@@ -182,11 +203,12 @@ class PipelineManager:
         try:
             result = []
             for name in sorted(os.listdir(RECORDINGS_DIR)):
-                if not name.endswith(".avi"):
+                if not name.endswith(".mkv"):
                     continue
                 try:
                     size = os.path.getsize(os.path.join(RECORDINGS_DIR, name))
-                    result.append({"name": name, "size": size})
+                    if size > 0:
+                        result.append({"name": name, "size": size})
                 except OSError:
                     pass
             return result
@@ -224,11 +246,11 @@ class PipelineManager:
             self._timer = None
         if self._proc:
             if self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
             if self.mode == "record" and self.recording_file:
                 if os.path.exists(self.recording_file):
                     self.recording_done = self.recording_file
@@ -619,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
         # ── File download ──────────────────────────────────────────────────
         if path.startswith("/recordings/"):
             filename = path[len("/recordings/"):]
-            if not filename or "/" in filename or not filename.endswith(".avi"):
+            if not filename or "/" in filename or not filename.endswith(".mkv"):
                 self.send_error(400, "Invalid filename")
                 return
             filepath = os.path.join(RECORDINGS_DIR, filename)
@@ -628,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             size = os.path.getsize(filepath)
             self.send_response(200)
-            self.send_header("Content-Type", "video/x-msvideo")
+            self.send_header("Content-Type", "video/x-matroska")
             self.send_header("Content-Length", str(size))
             self.send_header(
                 "Content-Disposition", f'attachment; filename="{filename}"'
